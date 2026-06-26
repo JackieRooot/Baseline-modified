@@ -9,7 +9,7 @@ from tqdm import tqdm
 from tensorboardX import SummaryWriter
 from config import config
 from model import StockTransformer
-from utils import engineer_features_39, engineer_features_158plus39
+from utils import engineer_features_39, engineer_features_158plus39, add_market_features
 from utils import create_ranking_dataset_vectorized
 import joblib
 import os
@@ -73,6 +73,23 @@ def _preprocess_common(df, stockid2idx, desc, drop_small_open=True):
         processed_list = list(tqdm(pool.imap(feature_engineer, groups), total=len(groups), desc=desc))
 
     processed = pd.concat(processed_list).reset_index(drop=True)
+
+    # 添加市场整体特征（新增优化：让模型感知市场状态）
+    processed = add_market_features(processed)
+
+    # 动态更新特征列表：包含新增的市场特征
+    market_feature_columns = [
+        'market_return_mean', 'market_return_std', 'market_return_median',
+        'market_return_max', 'market_return_min',
+        'market_volume_sum', 'market_volume_mean',
+        'market_amount_sum', 'market_amount_mean',
+        'market_amplitude_mean',
+        'relative_return', 'relative_volume', 'relative_amount',
+        'return_rank_pct', 'market_up_ratio'
+    ]
+    # 只添加实际存在的市场特征列
+    existing_market_features = [col for col in market_feature_columns if col in processed.columns]
+    feature_columns = feature_columns + existing_market_features
 
     # 映射股票索引，并剔除映射失败样本
     processed['instrument'] = processed['股票代码'].map(stockid2idx)
@@ -145,6 +162,30 @@ class WeightedRankingLoss(nn.Module):
         
         return loss
         
+    def topk_recall_loss(self, y_pred, y_true):
+        """
+        Top-5 精度直接优化损失：最大化真实 Top-5 股票被预测赋予高概率的总和。
+        思路：对预测分数做 softmax 得到概率分布，计算真实 Top-5 股票的预测概率之和，
+        损失为负的该概率之和（最小化损失 = 最大化概率之和）。
+        """
+        batch_size, num_items = y_true.size()
+        k = min(self.k, num_items)
+
+        # 预测概率分布
+        pred_probs = F.softmax(y_pred, dim=1)  # [batch, num_items]
+
+        # 找出真实 Top-5 的索引
+        _, top_indices = torch.topk(y_true, k, dim=1)  # [batch, k]
+
+        # 计算真实 Top-5 的预测概率之和
+        topk_probs_sum = 0.0
+        for i in range(batch_size):
+            topk_probs_sum += pred_probs[i, top_indices[i]].sum()
+
+        # 归一化并取负（损失越小越好）
+        loss = -topk_probs_sum / (batch_size * k)
+        return loss
+
     def forward(self, y_pred, y_true):
         """
         y_pred: [batch, num_items]
@@ -155,19 +196,22 @@ class WeightedRankingLoss(nn.Module):
 
         # 1. 识别 top-k 的样本
         _, top_indices = torch.topk(y_true, k, dim=1)
-        
+
         # 2. 创建权重向量
         weights = torch.full_like(y_true, fill_value=self.base_weight)
         for i in range(batch_size):
             weights[i, top_indices[i]] = self.weight_factor
-            
+
         # 3. 计算加权损失
         listwise = self.listwise_loss(y_pred, y_true, weights)
         pairwise = self.pairwise_loss(y_pred, y_true, weights)
-        
-        # 组合两种损失
-        total_loss = listwise + self.pairwise_weight * pairwise
-        
+
+        # 4. 计算 Top-5 精度直接优化损失（新增优化）
+        topk_recall = self.topk_recall_loss(y_pred, y_true)
+
+        # 组合三种损失（Top-5 精度损失权重设为 0.5，可调节）
+        total_loss = listwise + self.pairwise_weight * pairwise + 0.5 * topk_recall
+
         return total_loss
 
 def calculate_ranking_metrics(y_pred, y_true, masks, k=5):

@@ -9,32 +9,78 @@ def _rolling_linear_regression(x, y):
     x = np.vstack([np.ones(len(x)), x]).T
     beta, res, _, _ = np.linalg.lstsq(x, y, rcond=None)
     return beta[1], res[0] if len(res) > 0 else 0.0, np.sum((y - (x @ beta))**2)
+
+def add_market_features(df):
+    """
+    为每只股票注入当日市场整体特征，让模型感知市场热度。
+    输入：包含多只股票多日数据的 DataFrame，必须有 '日期'、'涨跌幅'、'成交量'、'成交额' 列。
+    输出：增加了市场统计特征的 DataFrame。
+    """
+    if '日期' not in df.columns:
+        return df  # 如果没有日期列，直接返回
+
+    # 按日期分组计算市场统计量
+    market_stats = df.groupby('日期').agg({
+        '涨跌幅': ['mean', 'std', 'median', 'max', 'min'],  # 市场整体涨跌统计
+        '成交量': ['sum', 'mean'],                          # 市场总成交量
+        '成交额': ['sum', 'mean'],                          # 市场总成交额
+        '振幅': 'mean',                                     # 市场平均振幅
+    }).reset_index()
+
+    # 重命名列
+    market_stats.columns = [
+        '日期',
+        'market_return_mean', 'market_return_std', 'market_return_median',
+        'market_return_max', 'market_return_min',
+        'market_volume_sum', 'market_volume_mean',
+        'market_amount_sum', 'market_amount_mean',
+        'market_amplitude_mean'
+    ]
+
+    # 合并到每只股票
+    df = df.merge(market_stats, on='日期', how='left')
+
+    # 计算相对特征：个股 vs 市场
+    df['relative_return'] = df['涨跌幅'] - df['market_return_mean']  # 相对市场涨跌
+    df['relative_volume'] = df['成交量'] / (df['market_volume_sum'] + 1e-12)  # 相对市场成交量
+    df['relative_amount'] = df['成交额'] / (df['market_amount_sum'] + 1e-12)  # 相对市场成交额
+
+    # 计算个股在市场中的排名（当日涨跌幅排名）
+    df['return_rank_pct'] = df.groupby('日期')['涨跌幅'].rank(pct=True)  # 百分位排名
+
+    # 计算市场热度指标（上涨股票占比）
+    market_up_ratio = df.groupby('日期').apply(lambda x: (x['涨跌幅'] > 0).sum() / len(x)).reset_index()
+    market_up_ratio.columns = ['日期', 'market_up_ratio']
+    df = df.merge(market_up_ratio, on='日期', how='left')
+
+    return df
 def engineer_features_158plus39(df):
     """
     计算39个技术指标特征和158个Alpha特征，并合并它们。
+    注意：市场特征在预处理阶段统一添加（需要跨股票按日期计算）。
     """
     # 为了避免修改原始DataFrame，创建一个副本
     df_copy = df.copy()
 
     # 1. 计算158个Alpha特征
     df_158 = engineer_features(df_copy)
-    
+
     # 2. 计算39个技术指标特征
     df_39 = engineer_features_39(df_copy)
 
     # 3. 合并两个DataFrame
     # 首先，从df_39中选取我们需要的列，避免与df_158中的原始列（如'开盘'）重复
     feature_cols_39 = [
-        'sma_5', 'sma_20', 'ema_12', 'ema_26', 'rsi', 'macd', 'macd_signal', 
-        'volume_change', 'obv', 'volume_ma_5', 'volume_ma_20', 'volume_ratio', 
-        'kdj_k', 'kdj_d', 'kdj_j', 'boll_mid', 'boll_std', 'atr_14', 'ema_60', 
-        'volatility_10', 'volatility_20', 'return_1', 'return_5', 'return_10',  
+        'sma_5', 'sma_20', 'ema_12', 'ema_26', 'rsi', 'macd', 'macd_signal',
+        'volume_change', 'obv', 'volume_ma_5', 'volume_ma_20', 'volume_ratio',
+        'kdj_k', 'kdj_d', 'kdj_j', 'boll_mid', 'boll_std', 'atr_14', 'ema_60',
+        'volatility_10', 'volatility_20', 'return_1', 'return_5', 'return_10',
         'high_low_spread', 'open_close_spread', 'high_close_spread', 'low_close_spread'
     ]
-    
+
     # 确保所有列都存在于df_39中
     feature_cols_39_exist = [col for col in feature_cols_39 if col in df_39.columns]
-    
+
     # 合并，df_158 已经包含了原始列和158个特征
     df_final = pd.concat([df_158, df_39[feature_cols_39_exist]], axis=1)
 
@@ -44,7 +90,7 @@ def engineer_features_158plus39(df):
     # 5. 统一处理inf和NaN
     df_final.replace([np.inf, -np.inf], np.nan, inplace=True)
     df_final.fillna(0, inplace=True)
-    
+
     return df_final
 
 def engineer_features_39(df):

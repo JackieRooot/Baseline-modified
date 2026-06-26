@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from config import config
 from model import StockTransformer
-from utils import engineer_features_39, engineer_features_158plus39
+from utils import engineer_features_39, engineer_features_158plus39, add_market_features
 
 
 feature_cloums_map = {
@@ -67,6 +67,24 @@ def preprocess_predict_data(df, stockid2idx):
 		processed_list = list(tqdm(pool.imap(feature_engineer, groups), total=len(groups), desc='预测集特征工程'))
 
 	processed = pd.concat(processed_list).reset_index(drop=True)
+
+	# 添加市场整体特征（与训练保持一致）
+	processed = add_market_features(processed)
+
+	# 动态更新特征列表：包含新增的市场特征
+	market_feature_columns = [
+		'market_return_mean', 'market_return_std', 'market_return_median',
+		'market_return_max', 'market_return_min',
+		'market_volume_sum', 'market_volume_mean',
+		'market_amount_sum', 'market_amount_mean',
+		'market_amplitude_mean',
+		'relative_return', 'relative_volume', 'relative_amount',
+		'return_rank_pct', 'market_up_ratio'
+	]
+	# 只添加实际存在的市场特征列
+	existing_market_features = [col for col in market_feature_columns if col in processed.columns]
+	feature_columns = feature_columns + existing_market_features
+
 	processed['instrument'] = processed['股票代码'].map(stockid2idx)
 	processed = processed.dropna(subset=['instrument']).copy()
 	processed['instrument'] = processed['instrument'].astype(np.int64)
@@ -137,13 +155,23 @@ def main():
 	model = StockTransformer(input_dim=len(features), config=config, num_stocks=len(stock_ids))
 	model.load_state_dict(torch.load(model_path, map_location=device))
 	model.to(device)
-	model.eval()
 
+	# MC Dropout 集成推理：多次前向传播取平均（新增优化）
+	# 保持 dropout 激活，模拟多个模型的预测
+	num_mc_samples = 10  # MC Dropout 样本数
+	model.train()  # 保持 dropout 激活（不调用 eval）
+
+	all_scores = []
 	with torch.no_grad():
 		x = torch.from_numpy(sequences_np).unsqueeze(0).to(device)  # [1, N, L, F]
-		scores = model(x).squeeze(0).detach().cpu().numpy()         # [N]
+		for _ in range(num_mc_samples):
+			scores = model(x).squeeze(0).detach().cpu().numpy()  # [N]
+			all_scores.append(scores)
 
-	order = np.argsort(scores)[::-1]
+	# 取平均分数（降低预测方差）
+	avg_scores = np.mean(all_scores, axis=0)
+
+	order = np.argsort(avg_scores)[::-1]
 	ranked_stock_ids = [sequence_stock_ids[i] for i in order]
 
 	# 仅输出前5，权重固定 0.2
