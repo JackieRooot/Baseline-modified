@@ -9,7 +9,11 @@ from tqdm import tqdm
 
 from config import config
 from model import StockTransformer
-from utils import engineer_features_39, engineer_features_158plus39, add_market_features
+from utils import (
+	engineer_features_39, engineer_features_158plus39, add_market_features,
+	add_fundamental_features, add_cleaning_features, add_industry_features,
+	FUNDAMENTAL_FEATURE_COLUMNS,
+)
 
 
 feature_cloums_map = {
@@ -84,6 +88,14 @@ def preprocess_predict_data(df, stockid2idx):
 	# 只添加实际存在的市场特征列
 	existing_market_features = [col for col in market_feature_columns if col in processed.columns]
 	feature_columns = feature_columns + existing_market_features
+
+	# 添加基本面/行业/清洗特征（与训练保持一致；旧数据无相应字段时原样返回）
+	processed = add_fundamental_features(processed)
+	processed = add_cleaning_features(processed)
+	processed = add_industry_features(processed)
+
+	existing_fundamental_features = [col for col in FUNDAMENTAL_FEATURE_COLUMNS if col in processed.columns]
+	feature_columns = feature_columns + existing_fundamental_features
 
 	processed['instrument'] = processed['股票代码'].map(stockid2idx)
 	processed = processed.dropna(subset=['instrument']).copy()
@@ -173,6 +185,21 @@ def main():
 
 	order = np.argsort(avg_scores)[::-1]
 	ranked_stock_ids = [sequence_stock_ids[i] for i in order]
+
+	# ST/停牌过滤：剔除最新交易日为 ST 或非正常交易的股票（基于原始字段，未被标准化影响）
+	# 仅在数据含 isST/tradestatus 时启用；若过滤后不足5只则回退到原始排序，保证产出
+	if ('isST' in raw_df.columns) or ('tradestatus' in raw_df.columns):
+		latest_rows = raw_df[raw_df['日期'] == latest_date]
+		ok = pd.Series(True, index=latest_rows.index)
+		if 'isST' in raw_df.columns:
+			ok &= (pd.to_numeric(latest_rows['isST'], errors='coerce').fillna(0) == 0)
+		if 'tradestatus' in raw_df.columns:
+			ok &= (pd.to_numeric(latest_rows['tradestatus'], errors='coerce').fillna(1) == 1)
+		tradeable = set(latest_rows.loc[ok, '股票代码'])
+		filtered_ids = [s for s in ranked_stock_ids if s in tradeable]
+		if len(filtered_ids) >= 5:
+			ranked_stock_ids = filtered_ids
+			print(f'ST/停牌过滤后可选股票数: {len(filtered_ids)}')
 
 	# 仅输出前5，权重固定 0.2
 	if len(ranked_stock_ids) < 5:

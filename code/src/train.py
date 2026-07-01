@@ -9,7 +9,11 @@ from tqdm import tqdm
 from tensorboardX import SummaryWriter
 from config import config
 from model import StockTransformer
-from utils import engineer_features_39, engineer_features_158plus39, add_market_features
+from utils import (
+    engineer_features_39, engineer_features_158plus39, add_market_features,
+    add_fundamental_features, add_cleaning_features, add_industry_features,
+    FUNDAMENTAL_FEATURE_COLUMNS,
+)
 from utils import create_ranking_dataset_vectorized
 import joblib
 import os
@@ -90,6 +94,15 @@ def _preprocess_common(df, stockid2idx, desc, drop_small_open=True):
     # 只添加实际存在的市场特征列
     existing_market_features = [col for col in market_feature_columns if col in processed.columns]
     feature_columns = feature_columns + existing_market_features
+
+    # 添加基本面/行业/清洗特征（第一优先级：baostock 扩展字段衍生）
+    # 旧数据不含相应字段时，下列函数原样返回，feature_columns 也不会变化
+    processed = add_fundamental_features(processed)
+    processed = add_cleaning_features(processed)
+    processed = add_industry_features(processed)
+
+    existing_fundamental_features = [col for col in FUNDAMENTAL_FEATURE_COLUMNS if col in processed.columns]
+    feature_columns = feature_columns + existing_fundamental_features
 
     # 映射股票索引，并剔除映射失败样本
     processed['instrument'] = processed['股票代码'].map(stockid2idx)
