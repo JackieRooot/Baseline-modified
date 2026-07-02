@@ -14,13 +14,18 @@ import os
 import time
 
 
-def login():
-    """登录baostock"""
-    lg = bs.login()
-    if lg.error_code != '0':
-        raise Exception(f"登录失败: {lg.error_msg}")
-    print("baostock登录成功")
-    return lg
+def login(max_retries=5, wait_seconds=5):
+    """登录baostock（带重试，缓解 baostock 偶发的“网络接收错误”）"""
+    last_msg = ''
+    for attempt in range(1, max_retries + 1):
+        lg = bs.login()
+        if lg.error_code == '0':
+            print(f"baostock登录成功（第 {attempt} 次尝试）")
+            return lg
+        last_msg = lg.error_msg
+        print(f"  登录失败（第 {attempt}/{max_retries} 次）: {lg.error_msg}，{wait_seconds} 秒后重试...")
+        time.sleep(wait_seconds)
+    raise Exception(f"登录失败（已重试 {max_retries} 次）: {last_msg}")
 
 
 def logout():
@@ -50,24 +55,26 @@ def get_hs300_stocks():
 def get_stock_history(bs_code, start_date, end_date):
     """获取单只股票历史数据"""
     rs = bs.query_history_k_data_plus(bs_code,
-        "date,code,open,high,low,close,preclose,volume,amount,turn,pctChg",
+        "date,code,open,high,low,close,preclose,volume,amount,turn,pctChg,"
+        "peTTM,pbMRQ,psTTM,pcfNcfTTM,isST,tradestatus",
         start_date=start_date, end_date=end_date,
         frequency="d", adjustflag="1")  # adjustflag="1"表示后复权
-    
+
     if rs.error_code != '0':
         raise Exception(f"查询失败: {rs.error_msg}")
-    
+
     data_list = []
     while (rs.error_code == '0') & rs.next():
         data_list.append(rs.get_row_data())
-    
+
     if not data_list:
         return None
-    
+
     df = pd.DataFrame(data_list, columns=rs.fields)
-    
-    # 转换数据类型
-    numeric_cols = ['open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg']
+
+    # 转换数据类型（含新增的估值与状态字段）
+    numeric_cols = ['open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg',
+                    'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM', 'isST', 'tradestatus']
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     
@@ -96,11 +103,34 @@ def get_stock_history(bs_code, start_date, end_date):
         'pctChg': '涨跌幅'
     })
     
-    columns = ['股票代码', '日期', '开盘', '收盘', '最高', '最低', 
-               '成交量', '成交额', '振幅', '涨跌额', '换手率', '涨跌幅']
+    columns = ['股票代码', '日期', '开盘', '收盘', '最高', '最低',
+               '成交量', '成交额', '振幅', '涨跌额', '换手率', '涨跌幅',
+               'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM', 'isST', 'tradestatus']
     df = df[columns]
-    
+
     return df
+
+
+def get_and_save_industry(save_dir):
+    """获取并保存股票行业分类，用于构造“个股相对行业强弱”特征。"""
+    print("正在获取行业分类...")
+    rs = bs.query_stock_industry()
+    if rs.error_code != '0':
+        print(f"  警告: 获取行业分类失败: {rs.error_msg}（跳过，不影响行情抓取）")
+        return
+    rows = []
+    while (rs.error_code == '0') & rs.next():
+        rows.append(rs.get_row_data())
+    if not rows:
+        print("  警告: 行业分类返回为空")
+        return
+    df = pd.DataFrame(rows, columns=rs.fields)
+    df['股票代码'] = df['code'].str.replace('sh.', '').str.replace('sz.', '').str.zfill(6)
+    out = df[['股票代码', 'industry']].copy()
+    out['industry'] = out['industry'].replace('', '未知').fillna('未知')
+    path = os.path.join(save_dir, 'stock_industry.csv')
+    out.to_csv(path, index=False, encoding='utf-8-sig')
+    print(f"  ✓ 行业分类已保存: {path}（{len(out)} 条）")
 
 
 def get_existing_stocks(output_path):
@@ -244,6 +274,9 @@ def main():
         # 保存成分股列表
         hs300_list_path = os.path.join(save_dir, "hs300_stock_list.csv")
         hs300_df.to_csv(hs300_list_path, index=False, encoding='utf-8-sig')
+
+        # 获取并保存行业分类（用于行业相对强弱特征）
+        get_and_save_industry(save_dir)
         
         # 读取现有数据（用于增量合并）
         existing_df = None

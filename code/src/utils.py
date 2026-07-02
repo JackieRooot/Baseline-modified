@@ -54,6 +54,120 @@ def add_market_features(df):
     df = df.merge(market_up_ratio, on='日期', how='left')
 
     return df
+
+
+# ====== baostock 扩展字段衍生特征（第一优先级：基本面 + 行业 + 清洗） ======
+# 这些字段需在 get_stock_data.py 中追加抓取后才会出现。
+# 若数据中不含相应字段（旧数据），下列函数均原样返回，保证向后兼容、不影响现有流程。
+
+# 估值原始字段（来自 baostock）
+FUNDAMENTAL_RAW_COLS = ['peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM']
+# 估值收益率型（倒数）特征命名
+_FUND_YIELD_NAME = {
+    'peTTM': 'ep_ratio',     # 盈利收益率 = 1/PE
+    'pbMRQ': 'bp_ratio',     # 账面市值比 = 1/PB
+    'psTTM': 'sp_ratio',     # 销售收益率 = 1/PS
+    'pcfNcfTTM': 'cfp_ratio',  # 现金流收益率 = 1/PCF
+}
+
+
+def add_fundamental_features(df):
+    """
+    基于 baostock 估值字段(peTTM/pbMRQ/psTTM/pcfNcfTTM)构造基本面特征：
+      - 原始估值值（清洗 inf/异常）
+      - 收益率型倒数特征（ep/bp/sp/cfp，仅对正值取倒数，负/缺失记 0）
+      - 当日横截面百分位排名（更稳健，缓解量纲与极端值）
+    需要包含 '日期' 列；若不含任何估值字段则原样返回。
+    """
+    present = [c for c in FUNDAMENTAL_RAW_COLS if c in df.columns]
+    if not present or '日期' not in df.columns:
+        return df
+
+    df = df.copy()
+    for col in present:
+        s = pd.to_numeric(df[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
+        df[col] = s.fillna(0.0)
+        # 收益率型（倒数）：仅正值有意义，非正/缺失记 0（用 where 规避除零告警）
+        pos = s.where(s > 0)
+        df[_FUND_YIELD_NAME[col]] = (1.0 / pos).fillna(0.0)
+        # 当日横截面百分位排名（缺失记 0）
+        df[col + '_rank_pct'] = df.groupby('日期')[col].rank(pct=True).fillna(0.0)
+    return df
+
+
+def add_cleaning_features(df):
+    """
+    基于 isST / tradestatus 构造清洗类特征：
+      - is_st：是否 ST（1=是）
+      - is_trading：当日是否正常交易（tradestatus==1 → 1）
+    用作模型输入，帮助模型规避 ST/停牌样本；不删除行以保持序列连续。
+    缺字段则跳过对应特征。
+    """
+    df = df.copy()
+    if 'isST' in df.columns:
+        df['is_st'] = pd.to_numeric(df['isST'], errors='coerce').fillna(0).astype(float)
+    if 'tradestatus' in df.columns:
+        df['is_trading'] = (pd.to_numeric(df['tradestatus'], errors='coerce').fillna(1) == 1).astype(float)
+    return df
+
+
+def add_industry_features(df, industry_path=None):
+    """
+    合并行业分类并构造“个股相对行业”的强弱特征：
+      - industry_return_mean / industry_return_std：同行业当日涨跌幅均值/标准差
+      - rel_industry_return：个股涨跌幅 - 行业均值（行业内相对强弱）
+      - industry_return_rank_pct：个股在本行业当日的百分位排名
+      - industry_up_ratio：本行业当日上涨股票占比
+    行业映射来源：df 自带 'industry' 列，或读取 industry_path(默认 data/stock_industry.csv)。
+    无行业信息则原样返回。
+    """
+    if industry_path is None:
+        industry_path = os.path.join('./data', 'stock_industry.csv')
+
+    if 'industry' not in df.columns:
+        if not os.path.exists(industry_path):
+            return df
+        try:
+            ind = pd.read_csv(industry_path, dtype={'股票代码': str})
+        except Exception:
+            return df
+        if '股票代码' not in ind.columns or 'industry' not in ind.columns:
+            return df
+        # 用临时键(zfill 后的字符串)匹配行业，绝不修改原始 股票代码 列，
+        # 否则会破坏调用方后续的 股票代码→instrument 映射。
+        ind_map = dict(zip(
+            ind['股票代码'].astype(str).str.zfill(6),
+            ind['industry'],
+        ))
+        df = df.copy()
+        df['industry'] = df['股票代码'].astype(str).str.zfill(6).map(ind_map)
+    else:
+        df = df.copy()
+
+    if '日期' not in df.columns:
+        return df
+
+    df['industry'] = df['industry'].fillna('未知')
+    grp = df.groupby(['日期', 'industry'])
+    df['industry_return_mean'] = grp['涨跌幅'].transform('mean')
+    df['industry_return_std'] = grp['涨跌幅'].transform('std').fillna(0.0)
+    df['rel_industry_return'] = df['涨跌幅'] - df['industry_return_mean']
+    df['industry_return_rank_pct'] = df.groupby(['日期', 'industry'])['涨跌幅'].rank(pct=True).fillna(0.0)
+    df['industry_up_ratio'] = grp['涨跌幅'].transform(lambda x: (x > 0).mean())
+    return df
+
+
+# 新增特征的完整列名清单（供 train.py / predict.py 动态筛选已存在的列）
+FUNDAMENTAL_FEATURE_COLUMNS = [
+    'peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM',
+    'ep_ratio', 'bp_ratio', 'sp_ratio', 'cfp_ratio',
+    'peTTM_rank_pct', 'pbMRQ_rank_pct', 'psTTM_rank_pct', 'pcfNcfTTM_rank_pct',
+    'is_st', 'is_trading',
+    'industry_return_mean', 'industry_return_std', 'rel_industry_return',
+    'industry_return_rank_pct', 'industry_up_ratio',
+]
+
+
 def engineer_features_158plus39(df):
     """
     计算39个技术指标特征和158个Alpha特征，并合并它们。
